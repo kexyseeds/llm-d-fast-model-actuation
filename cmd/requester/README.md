@@ -5,6 +5,9 @@ The example here uses a direct provider, and this functionality is planned to
 eventually be deprecated because using launchers is now the focus of our
 attention.
 
+For upstream SGLang, see [SGLang Direct Providers](../../docs/sglang-direct-provider.md)
+for engine selection, deployment configuration, and recovery limitations.
+
 ## Requester Overview
 
 The requester executable runs in the requester container of a server-requesting

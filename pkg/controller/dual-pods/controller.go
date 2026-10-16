@@ -404,6 +404,10 @@ type GpuLocation struct {
 
 // nodeData is the root of data specific to a node.
 type nodeData struct {
+	// SGLang knowledge survives requester replacement, but not controller restart.
+	// Access only from the serialized node processing loop.
+	SGLang map[apitypes.UID]*sglangState
+
 	NodeName string
 
 	// InferenceServers maps UID of serve-requesting Pod to data.
@@ -657,6 +661,7 @@ func nodeNameIndexFunc(obj any) ([]string, error) {
 func (ctl *controller) OnAdd(obj any, isInInitialList bool) {
 	switch typed := obj.(type) {
 	case *corev1.Pod:
+		ctl.enqueueSGLangProvider(typed)
 		if item, it := careAbout(typed); it == infSvrItemDontCare {
 			ctl.enqueueLogger.V(5).Info("Ignoring add of irrelevant Pod", "name", typed.Name)
 			return
@@ -721,6 +726,7 @@ func (ctl *controller) OnAdd(obj any, isInInitialList bool) {
 func (ctl *controller) OnUpdate(prev, obj any) {
 	switch typed := obj.(type) {
 	case *corev1.Pod:
+		ctl.enqueueSGLangProvider(typed)
 		if item, it := careAbout(typed); it == infSvrItemDontCare {
 			ctl.enqueueLogger.V(5).Info("Ignoring update of irrelevant Pod", "name", typed.Name)
 			return
@@ -819,6 +825,7 @@ func (ctl *controller) OnDelete(obj any) {
 	}
 	switch typed := obj.(type) {
 	case *corev1.Pod:
+		ctl.enqueueSGLangProvider(typed)
 		if item, it := careAbout(typed); it == infSvrItemDontCare {
 			ctl.enqueueLogger.V(5).Info("Ignoring delete of irrelevant Pod", "name", typed.Name)
 			return

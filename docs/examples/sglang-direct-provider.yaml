@@ -1,0 +1,88 @@
+# Replace the requester image before use; see ../sglang-direct-provider.md.
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: sglang-request
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sglang-requester
+  template:
+    metadata:
+      labels:
+        app: sglang-requester
+      annotations:
+        dual-pods.llm-d.ai/engine: sglang
+        dual-pods.llm-d.ai/engine-operation-timeout: 5m
+        dual-pods.llm-d.ai/server-patch: |
+          metadata:
+            labels:
+              app: null
+              model: qwen3-0.6b
+          spec:
+            containers:
+            - name: inference-server
+              image: docker.io/lmsysorg/sglang:v0.5.21
+              command: [python3, -m, sglang.launch_server]
+              args:
+              - --model-path=Qwen/Qwen3-0.6B
+              - --host=0.0.0.0
+              - --port=8000
+              - --enable-memory-saver
+              - --enable-weights-cpu-backup
+              env:
+              - name: SGLANG_MEMORY_SAVER_CUDA_GRAPH
+                value: "1"
+              # Required when the NVIDIA runtime grants device access via env.
+              # The controller sets CUDA_VISIBLE_DEVICES to assigned indices.
+              - name: NVIDIA_VISIBLE_DEVICES
+                value: all
+              ports:
+              - name: http
+                containerPort: 8000
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                limits:
+                  cpu: "4"
+                  memory: 16Gi
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: 8000
+                periodSeconds: 5
+    spec:
+      containers:
+      - name: inference-server
+        image: YOUR_REGISTRY/requester:YOUR_FMA_BUILD_TAG
+        ports:
+        - name: probes
+          containerPort: 8080
+        - name: spi
+          containerPort: 8081
+        - name: proxy
+          containerPort: 8082
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          periodSeconds: 2
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+            cpu: 200m
+            memory: 250Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang
+spec:
+  selector:
+    app: sglang-requester
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8082

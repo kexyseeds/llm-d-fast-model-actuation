@@ -230,6 +230,17 @@ func (item infSvrItem) process(urCtx context.Context, ctl *controller, nodeDat *
 
 	podOps := ctl.coreclient.Pods(ctl.namespace)
 
+	// Fence uncertain SGLang processes before releasing requester finalizers or
+	// starting any other engine on this node (including vLLM).
+	if err := ctl.guardSGLangProviders(ctx, nodeDat); err != nil {
+		return processResult{err: err, retry: true}
+	}
+	if requestingPod != nil && requestingPod.DeletionTimestamp == nil {
+		if _, _, err := directEngineConfig(requestingPod); err != nil {
+			return ctl.ensureReqStatus(ctx, requestingPod, serverDat, err.Error())
+		}
+	}
+
 	// Delete the in-memory data after both Pods are gone.
 	// Also un-assert the binding metric.
 	if requestingPod == nil && providingPod == nil {
@@ -520,7 +531,7 @@ func (item infSvrItem) process(urCtx context.Context, ctl *controller, nodeDat *
 			}
 			serverDat.InstanceKnownToExist = true
 		}
-		if serverDat.Sleeping == nil {
+		if serverDat.Sleeping == nil || isSGLang(providingPod) {
 			sleeping, err := ctl.querySleeping(ctx, iscName, providingPod, serverPort)
 			if err != nil {
 				return processResult{err: err, retry: true, retryAfter: 5 * time.Second}
@@ -687,6 +698,9 @@ func (item infSvrItem) process(urCtx context.Context, ctl *controller, nodeDat *
 			return processResult{err: errors.Join(wrappedErr, innerResult.err), retry: true}
 		}
 		serverDat.Sleeping = ptr.To(false)
+		if isSGLang(echo) {
+			nodeDat.rememberNewSGLang(echo)
+		}
 		logger.V(2).Info("Created server-providing pod", "name", echo.Name, "gpus", serverDat.GPUIndicesStr, "annotations", echo.Annotations, "labels", echo.Labels, "resourceVersion", echo.ResourceVersion, "k8sCallStartTime", createStartStr)
 
 		return ctl.ensureReqStatus(ctx, requestingPod, serverDat)
@@ -1513,6 +1527,13 @@ func (ctl *controller) bind(ctx context.Context, serverDat *serverData, requesti
 // Pod update where possible).
 // The `lClient` arg may be `nil`, if not then is used to do GPU memory debugging
 func (ctl *controller) wakeUp(ctx context.Context, serverDat *serverData, requestingPod, providingPod *corev1.Pod, serverPort int32, description string, lClient *LauncherClient) error {
+	if isSGLang(providingPod) {
+		if err := ctl.setSGLangSleeping(ctx, providingPod, serverPort, false); err != nil {
+			return err
+		}
+		serverDat.Sleeping = ptr.To(false)
+		return nil
+	}
 	if ctl.debugAccelMemory {
 		if err := ctl.accelMemoryIsLowEnough(ctx, requestingPod, serverDat); err != nil {
 			return err
@@ -1737,6 +1758,16 @@ func (ctl *controller) ensureUnbound(ctx context.Context, serverDat *serverData,
 			return err
 		}
 	}
+	if isSGLang(providingPod) {
+		_, port, err := utils.GetInferenceServerContainerIndexAndPort(providingPod)
+		if err != nil {
+			return err
+		}
+		if err := ctl.setSGLangSleeping(ctx, providingPod, port, true); err != nil {
+			return err
+		}
+		serverDat.Sleeping = ptr.To(true)
+	}
 	// A providingPod with no IP is not scheduled, so we know that it is not awake.
 	// If providingPod is stale then the update will fail.
 	if (serverDat.Sleeping == nil || !*(serverDat.Sleeping)) && providingPod.Status.PodIP != "" { // need to put to sleep
@@ -1788,7 +1819,10 @@ func (ctl *controller) ensureUnbound(ctx context.Context, serverDat *serverData,
 		aChange = true
 	}
 	// Ensure finalizer is absent
-	providingPod.Finalizers, fChange = utils.SliceRemoveOnce(providingPod.Finalizers, providerFinalizer)
+	// Retain SGLang's finalizer until termination is confirmed, even unbound.
+	if !isSGLang(providingPod) {
+		providingPod.Finalizers, fChange = utils.SliceRemoveOnce(providingPod.Finalizers, providerFinalizer)
+	}
 	// Remove ISC labels
 	for k := range serverDat.InstanceISCLabels {
 		if _, have := providingPod.Labels[k]; have {
@@ -1898,6 +1932,10 @@ func (ctl *controller) maybeDeleteObsoleteInstance(ctx context.Context, serverDa
 // Returns (NominalProvidingPod, NominalProvidingPodHash, error)
 func (serverDat *serverData) getNominalServerProvidingPod(ctx context.Context, reqPod *corev1.Pod, rawTmpl string, data api.ProviderData) (*corev1.Pod, string, error) {
 	logger := klog.FromContext(ctx)
+	engine, timeout, err := directEngineConfig(reqPod)
+	if err != nil {
+		return nil, "", err
+	}
 	if serverDat.NominalProvidingPod == nil {
 		logger.V(5).Info("Building server-providing pod from patch", "patch", rawTmpl)
 		tmpl, err := template.New("serverPatch").Option("missingkey=error").Parse(rawTmpl)
@@ -1936,6 +1974,10 @@ func (serverDat *serverData) getNominalServerProvidingPod(ctx context.Context, r
 		}
 		hasher := sha256.New()
 		hasher.Write(modifiedJSON)
+		// Preserve the existing default vLLM hash; SGLang cannot reuse it.
+		if engine == "sglang" {
+			hasher.Write([]byte(";engine=sglang;timeout=" + timeout.String()))
+		}
 		hasher.Write([]byte(";gpus="))
 		hasher.Write([]byte(*serverDat.GPUIndicesStr))
 		hasher.Write([]byte(";node="))
@@ -1992,6 +2034,12 @@ func (serverDat *serverData) getNominalServerProvidingPod(ctx context.Context, r
 		pod.GenerateName = reqPod.Name + "-dual-"
 		pod.Finalizers = append(pod.Finalizers, providerFinalizer)
 		pod.Annotations = utils.MapSet(pod.Annotations, nominalHashAnnotationKey, nominalHash)
+		pod.Annotations[api.EngineAnnotationName] = engine
+		if engine == "sglang" {
+			pod.Annotations[api.EngineOperationTimeoutAnnotationName] = timeout.String()
+			// A sleeper must not restart and reclaim a competitor's GPU memory.
+			pod.Spec.RestartPolicy = corev1.RestartPolicyNever
+		}
 		pod.Annotations[requesterAnnotationKey] = string(reqPod.UID) + " " + reqPod.Name
 		pod.Annotations[api.AcceleratorsAnnotationName] = *serverDat.GPUIDsStr
 		pod.Labels = utils.MapSet(pod.Labels, api.DualLabelName, reqPod.Name)
@@ -2038,6 +2086,17 @@ func getReducedInferenceContainerState(from *corev1.Pod) *reducedContainerState 
 }
 
 func (ctl *controller) querySleeping(ctx context.Context, iscName string, providingPod *corev1.Pod, serverPort int32) (bool, error) {
+	if isSGLang(providingPod) {
+		node, err := getProviderNodeName(providingPod)
+		if err != nil {
+			return false, err
+		}
+		state := ctl.getNodeData(node).sglangKnowledge(providingPod)
+		if state.phase != sglangAwake && state.phase != sglangReleased {
+			return false, fmt.Errorf("SGLang provider %s state is %s", providingPod.Name, state.phase)
+		}
+		return state.phase == sglangReleased, nil
+	}
 	queryURL := fmt.Sprintf("http://%s:%d/is_sleeping", providingPod.Status.PodIP, serverPort)
 	var sleepState api.SleepState
 	_, err := doHTTP(ctx, "query_sleeping", "GET", queryURL, nil, ctl.httpLatencySecsHistograms.MustCurryWith(prometheus.Labels{"isc_name": iscName}), nil, httpResultConsumer{json: &sleepState})
@@ -2277,6 +2336,10 @@ type httpResultConsumer struct {
 // Do an HTTP call.
 // latencyHistogramVec needs values for labels purpose, method, status_code
 func doHTTP(ctx context.Context, purpose, method, url string, reqHeaders http.Header, latencyHistogramVec ObserverCube, requestData any, resultConsumer httpResultConsumer) (int, error) {
+	return doHTTPWithClient(ctx, myHTTPClient, purpose, method, url, reqHeaders, latencyHistogramVec, requestData, resultConsumer)
+}
+
+func doHTTPWithClient(ctx context.Context, client *http.Client, purpose, method, url string, reqHeaders http.Header, latencyHistogramVec ObserverCube, requestData any, resultConsumer httpResultConsumer) (int, error) {
 	var reqBody io.Reader
 	if requestData != nil {
 		b, err := json.Marshal(requestData)
@@ -2304,7 +2367,7 @@ func doHTTP(ctx context.Context, purpose, method, url string, reqHeaders http.He
 		}
 	}
 	httpCallStartTime := time.Now()
-	resp, err := myHTTPClient.Do(req)
+	resp, err := client.Do(req)
 	latencySecs := time.Since(httpCallStartTime).Seconds()
 	var statusCode int
 	if resp != nil {

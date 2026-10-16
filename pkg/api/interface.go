@@ -52,6 +52,13 @@ const ServerPatchAnnotationName = "dual-pods.llm-d.ai/server-patch"
 // This annotation is mutually exclusive with the 'ServerPatchAnnotationName' annotation.
 const InferenceServerConfigAnnotationName = "dual-pods.llm-d.ai/inference-server-config"
 
+// EngineAnnotationName selects the Direct Provider engine: vllm (default) or sglang.
+const EngineAnnotationName = "dual-pods.llm-d.ai/engine"
+
+// EngineOperationTimeoutAnnotationName bounds SGLang release/resume operations.
+// Values are Go durations in (0, 1h]; the default is 5m.
+const EngineOperationTimeoutAnnotationName = "dual-pods.llm-d.ai/engine-operation-timeout"
+
 // StatusAnnotationName is the name of an annotation that the dual-pods controller
 // maintains reporting the ServerRequestingPodStatus. The value of this annotation is the
 // JSON rendering of the status.
@@ -65,7 +72,7 @@ type ServerRequestingPodStatus struct {
 }
 
 // InferenceServerContainerName is the name of the container which is described by the server patch.
-// This container is expected to run the inference server using vLLM.
+// This container runs the inference server selected by EngineAnnotationName.
 const InferenceServerContainerName = "inference-server"
 
 // AdminPortAnnotationName is the name of an annotation whose value
